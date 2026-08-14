@@ -1,6 +1,6 @@
 {
   "name": "dsh-prompt-manager",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "View, hook, replace, and switch DeepSeek Harness system prompts via presets",
   "type": "module",
   "main": "index.js",
