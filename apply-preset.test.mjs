@@ -7,7 +7,7 @@ const BASE = [
   { name: 'harness:identity', text: 'identity' },
   { name: 'harness:source', text: 'source' },
   { name: 'app:web-surface', text: 'web' },
-  { name: 'deployment:persona', text: 'persona' },
+  { name: 'deployment:persona-prefix', text: 'persona' },
   { name: 'tool:read', text: 'read' }
 ]
 const names = (sections) => sections.map((s) => s.name)
@@ -19,60 +19,60 @@ const norm = (rules) => normalizePreset({ label: 't', description: '', overrides
     { action: 'insert', section: 'sec:a', after: 'harness:identity', text: 'A' },
     { action: 'insert', section: 'sec:z', text: 'Z' }
   ]))
-  assert.deepEqual(names(out), ['harness:identity', 'sec:a', 'harness:source', 'app:web-surface', 'deployment:persona', 'tool:read', 'sec:z'])
+  assert.deepEqual(names(out), ['harness:identity', 'sec:a', 'harness:source', 'app:web-surface', 'deployment:persona-prefix', 'tool:read', 'sec:z'])
 }
 
-// 2. top/order -1000 → 压倒一切，排在 harness:identity 之前
+// 2. top/order -2000 → 压倒一切，排在 harness:identity 之前
 {
-  const out = applyPreset(BASE, norm([{ action: 'insert', section: 'sec:top', text: 'T', order: -1000 }]))
+  const out = applyPreset(BASE, norm([{ action: 'insert', section: 'sec:top', text: 'T', order: -2000 }]))
   assert.equal(out[0].name, 'sec:top')
 }
 
-// 3. normalizePreset: top: true → TOP_ORDER (-1000)
+// 3. normalizePreset: top: true → TOP_ORDER (-2000)
 {
   const r = norm([{ action: 'insert', section: 'sec:t2', text: 'T', top: true }])
-  assert.equal(r[0].order, -1000)
+  assert.equal(r[0].order, -2000)
 }
 
 // 4. 小数 order → 落在对应区间（index 代理）
 {
   const out = applyPreset(BASE, norm([{ action: 'insert', section: 'sec:m', text: 'M', order: 2.5 }]))
   // index 0,1,2,3,4 → 2.5 落在 index2(app:web-surface) 与 index3(persona) 之间
-  assert.deepEqual(names(out), ['harness:identity', 'harness:source', 'app:web-surface', 'sec:m', 'deployment:persona', 'tool:read'])
+  assert.deepEqual(names(out), ['harness:identity', 'harness:source', 'app:web-surface', 'sec:m', 'deployment:persona-prefix', 'tool:read'])
 }
 
 // 5. order 与 after 同时给出：order 胜出（重排）
 {
-  const out = applyPreset(BASE, norm([{ action: 'insert', section: 'sec:x', text: 'X', after: 'deployment:persona', order: 1.5 }]))
-  assert.deepEqual(names(out), ['harness:identity', 'harness:source', 'sec:x', 'app:web-surface', 'deployment:persona', 'tool:read'])
+  const out = applyPreset(BASE, norm([{ action: 'insert', section: 'sec:x', text: 'X', after: 'deployment:persona-prefix', order: 1.5 }]))
+  assert.deepEqual(names(out), ['harness:identity', 'harness:source', 'sec:x', 'app:web-surface', 'deployment:persona-prefix', 'tool:read'])
 }
 
 // 6. 混合：无 order 的插入保持锚点位置，有 order 的跳位
 {
   const out = applyPreset(BASE, norm([
     { action: 'insert', section: 'sec:anchored', text: 'A', after: 'harness:identity' },
-    { action: 'insert', section: 'sec:jump', text: 'J', order: -1000 }
+    { action: 'insert', section: 'sec:jump', text: 'J', order: -2000 }
   ]))
-  assert.deepEqual(names(out), ['sec:jump', 'harness:identity', 'sec:anchored', 'harness:source', 'app:web-surface', 'deployment:persona', 'tool:read'])
+  assert.deepEqual(names(out), ['sec:jump', 'harness:identity', 'sec:anchored', 'harness:source', 'app:web-surface', 'deployment:persona-prefix', 'tool:read'])
 }
 
 // 7. replace 携带 order → 该段整体移动
 {
-  const out = applyPreset(BASE, norm([{ action: 'replace', section: 'deployment:persona', text: 'NEW', order: -1000 }]))
-  assert.equal(out[0].name, 'deployment:persona')
+  const out = applyPreset(BASE, norm([{ action: 'replace', section: 'deployment:persona-prefix', text: 'NEW', order: -2000 }]))
+  assert.equal(out[0].name, 'deployment:persona-prefix')
   assert.equal(out[0].text, 'NEW')
 }
 
 // 8. remove 正常 + 剩余保持相对顺序
 {
   const out = applyPreset(BASE, norm([{ action: 'remove', section: 'tool:read' }]))
-  assert.deepEqual(names(out), ['harness:identity', 'harness:source', 'app:web-surface', 'deployment:persona'])
+  assert.deepEqual(names(out), ['harness:identity', 'harness:source', 'app:web-surface', 'deployment:persona-prefix'])
 }
 
 // 9. 基础数组不被修改（纯函数）
 {
   const before = JSON.stringify(BASE)
-  applyPreset(BASE, norm([{ action: 'insert', section: 'sec:n', text: 'N', order: -1000 }]))
+  applyPreset(BASE, norm([{ action: 'insert', section: 'sec:n', text: 'N', order: -2000 }]))
   assert.equal(JSON.stringify(BASE), before)
 }
 
@@ -93,14 +93,14 @@ const norm = (rules) => normalizePreset({ label: 't', description: '', overrides
   assert.equal(byName['harness:identity'], 0)
   assert.equal(byName['harness:source'], 1)
   assert.equal(byName['app:web-surface'], 2)
-  assert.equal(byName['deployment:persona'], 3)
+  assert.equal(byName['deployment:persona-prefix'], 3)
   assert.equal(byName['tool:read'], 4)
   // 中点：2.5 与 3 之间 → 2.75，应落在 sec:m 与 persona 之间
   const mid = applyPreset(BASE, norm([
     { action: 'insert', section: 'sec:m', text: 'M', order: 2.5 },
     { action: 'insert', section: 'sec:n', text: 'N', order: (2.5 + 3) / 2 }
   ]))
-  assert.deepEqual(names(mid), ['harness:identity', 'harness:source', 'app:web-surface', 'sec:m', 'sec:n', 'deployment:persona', 'tool:read'])
+  assert.deepEqual(names(mid), ['harness:identity', 'harness:source', 'app:web-surface', 'sec:m', 'sec:n', 'deployment:persona-prefix', 'tool:read'])
 }
 
 // 12. 无 order 时 keys = 数组下标（顺序保持）

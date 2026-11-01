@@ -3,7 +3,7 @@
 // personalized, toggle switches), and visualizing the assembly pipeline
 // (幕布): how sections from different sources aggregate into the final prompt.
 // Served as a browser module through the client module host; talks to the
-// host half over the loopback /api RPC channel (prompt-manager/* endpoints).
+// host half over the dedicated /prompt-manager-rpc Connection RPC channel.
 window.__ModuleLoader__.load({
 	id: "dsh-prompt-manager",
 	factory: (require) => {
@@ -218,7 +218,8 @@ window.__ModuleLoader__.load({
 		}
 
 		// ── 表单化规则编辑器：action / 位置用下拉选择，不手写字段 ──────────────
-		const TOP_ORDER = -1000; // 与 host normalizePreset 的置顶哨兵一致
+		const TOP_ORDER = -2000; // 与 host normalizePreset 的置顶哨兵一致
+		const RPC_CHANNEL = "/prompt-manager-rpc"; // host 以 webServer prefix 路由挂载同一通道
 		const ACTION_OPTIONS = [
 			{ value: "insert", label: "插入（新增一段）" },
 			{ value: "replace", label: "替换（改写已有段）" },
@@ -428,7 +429,7 @@ window.__ModuleLoader__.load({
 				}
 				const timer = setTimeout(() => {
 					setState((s) => ({ ...s, loading: true, error: null }));
-					callRpc(call, "prompt-manager/previewPreset", { overrides: complete })
+					callRpc(call, "previewPreset", { overrides: complete })
 						.then((data) => { if (alive) setState({ loading: false, data, error: null }); })
 						.catch((e) => { if (alive) setState({ loading: false, data: null, error: String(e && e.message ? e.message : e) }); });
 				}, 250);
@@ -540,7 +541,7 @@ window.__ModuleLoader__.load({
 			const loadAll = useCallback(() => {
 				setBusy(true);
 				setError(null);
-				return callRpc(call, "prompt-manager/listPresets", {})
+				return callRpc(call, "listPresets", {})
 					.then((p) => { setPresets(p); setBusy(false); })
 					.catch((e) => { setError(String(e && e.message ? e.message : e)); setBusy(false); });
 			}, [call]);
@@ -555,8 +556,8 @@ window.__ModuleLoader__.load({
 					.catch((e) => { setError(String(e && e.message ? e.message : e)); setBusy(false); });
 			}, [loadAll]);
 
-			const toggle = (name, active) => run(() => callRpc(call, "prompt-manager/setActive", { name: active ? "" : name }));
-			const remove = (name) => run(() => callRpc(call, "prompt-manager/deletePreset", { name }));
+			const toggle = (name, active) => run(() => callRpc(call, "setActive", { name: active ? "" : name }));
+			const remove = (name) => run(() => callRpc(call, "deletePreset", { name }));
 			const create = () => {
 				const name = newName.trim();
 				if (!name) return;
@@ -568,7 +569,7 @@ window.__ModuleLoader__.load({
 				// 新建 = 打开"新预设草稿"编辑器，**不立即创建文件**；
 				// 保存时才原子创建（createPreset 带完整字段），字段不完整保存被
 				// 校验拦截 → 空预设根本不会产生。
-				void callRpc(call, "prompt-manager/getPipeline", {}).catch(() => null)
+				void callRpc(call, "getPipeline", {}).catch(() => null)
 					.then((pipeline) => {
 						const names = [];
 						const seen = new Set();
@@ -585,8 +586,8 @@ window.__ModuleLoader__.load({
 			const openEditor = (name) => {
 				// 结构化读取：host 已用 js-yaml 解析好，浏览器端不解析 YAML
 				void Promise.all([
-					callRpc(call, "prompt-manager/getPreset", { name }),
-					callRpc(call, "prompt-manager/getPipeline", {}).catch(() => null)
+					callRpc(call, "getPreset", { name }),
+					callRpc(call, "getPipeline", {}).catch(() => null)
 				])
 					.then(([preset, pipeline]) => {
 						if (preset === null || preset === undefined) throw new Error(`预设 ${name} 不存在`);
@@ -617,8 +618,8 @@ window.__ModuleLoader__.load({
 				// 新预设：保存时才原子创建（createPreset 带完整字段，且拒绝覆盖已存在
 				// 的同名预设）；已有预设：updatePreset 更新。字段不完整时保存按钮已禁用。
 				const action = isNew
-					? callRpc(call, "prompt-manager/createPreset", { name, label, description, overrides })
-					: callRpc(call, "prompt-manager/updatePreset", { name, label, description, overrides });
+					? callRpc(call, "createPreset", { name, label, description, overrides })
+					: callRpc(call, "updatePreset", { name, label, description, overrides });
 				void run(() => action);
 			};
 			const addRule = () => {
@@ -651,7 +652,7 @@ window.__ModuleLoader__.load({
 				}
 				if (!editing.yamlMode) {
 					// 切到 YAML：拉取原始文件文本
-					void callRpc(call, "prompt-manager/getPresetYaml", { name: editing.name })
+					void callRpc(call, "getPresetYaml", { name: editing.name })
 						.then((yaml) => setEditing({ ...editing, yamlMode: true, yaml }))
 						.catch((e) => setError(String(e && e.message ? e.message : e)));
 				} else {
@@ -662,7 +663,7 @@ window.__ModuleLoader__.load({
 				if (!editing || !editing.yamlMode) return;
 				const name = editing.name;
 				setEditing(null);
-				void run(() => callRpc(call, "prompt-manager/updatePresetYaml", { name, yaml: editing.yaml }));
+				void run(() => callRpc(call, "updatePresetYaml", { name, yaml: editing.yaml }));
 			};
 
 			const children = [];
@@ -875,13 +876,13 @@ window.__ModuleLoader__.load({
 				order: 25,
 				label: () => "提示词管理",
 				inject: () => ({
-					call: (endpoint, payload) => ctx.connection.rpc.call("/api", endpoint, payload)
+					call: (endpoint, payload) => ctx.connection.rpc.call(RPC_CHANNEL, endpoint, payload)
 				})
 			}, PromptManagerSection));
 		}
 
 		/** Required services (cordis fiber inject — service names, not package names).
-		 *  `slots` is provided by @deepseek-ai/dsh-client-runtime, `connection` by
+		 *  `slots` is provided by the client runtime shell, `connection` by
 		 *  @deepseek-ai/dsh-client-connection; the package-name list in package.json
 		 *  `dsh.client.inject` only drives client-module loading, not fiber inject. */
 		const inject = ["slots", "connection"];

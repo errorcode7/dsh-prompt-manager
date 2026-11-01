@@ -9,7 +9,8 @@
 //    scope; a scope with an effective `complete: true` section is restored by
 //    the registry after the waterfall (documented limitation).
 //  - Agent tools: switch_prompt / list_prompts / get_prompt / save_prompt.
-//  - /api RPC endpoints `prompt-manager/*` (loopback) for the client half.
+//  - A dedicated Connection RPC channel (`/prompt-manager-rpc`) for the client
+//    half and the standalone pipeline page.
 import { isModelInvocable } from '@deepseek-ai/dsh-skill'
 import { Service } from '@deepseek-ai/cordis'
 import z from '@deepseek-ai/schemastery'
@@ -42,9 +43,15 @@ const SECTION_NAME_RE = /^[a-z][a-z0-9_.:-]*$/
 const ACTIVE_FILENAME = 'active.yml'
 /** Valid preset rule actions. */
 const ACTIONS = ['replace', 'insert', 'remove']
-/** Sentinel order for a "top" rule: below every known base section (harness:identity = -100),
+/** Sentinel order for a "top" rule: below every base section (harness:identity = -1000),
  *  so `top: true` / 置顶 makes the section render as the very first prompt section. */
-const TOP_ORDER = -1000
+const TOP_ORDER = -2000
+/** Dedicated RPC channel (shared by the settings tab and the pipeline page). */
+const RPC_CHANNEL = '/prompt-manager-rpc'
+/** Endpoint names are single URL segments (method names). */
+const RPC_ENDPOINT_RE = /^[A-Za-z0-9_$.-]+$/
+/** Request body cap for the JSON RPC channel. */
+const MAX_RPC_BODY_BYTES = 8 * 1024 * 1024
 /** 幕布轮次时间轴：保留最近 N 轮真实组装快照（每次真实模型步骤产生一轮）。 */
 const REAL_SNAPSHOT_LIMIT = 20
 /** 对话历史侧栏：每个 session 保留最近 M 轮。 */
@@ -64,10 +71,11 @@ function resolveDshHome() {
  * curated read-only map for display; unknown names fall back to a generic hint.
  */
 const SECTION_OWNERS = [
-  { match: (name) => name === 'harness:identity', owner: '@deepseek-ai/dsh-system-prompt 内置（order -100）' },
-  { match: (name) => name === 'harness:source', owner: 'dsh-app-boot 启动注入（实现 checkout 说明）' },
-  { match: (name) => name === 'app:web-surface', owner: '@deepseek-ai/dsh-web-app（Web 表面说明）' },
-  { match: (name) => name === 'deployment:persona', owner: 'dsh-system-prompt 配置 config.persona（order 0）；可按 agent 由 dsh-persona 覆盖' },
+  { match: (name) => name === 'harness:identity', owner: '@deepseek-ai/dsh-system-prompt 内置（order -1000）' },
+  { match: (name) => name === 'harness:source', owner: '@deepseek-ai/dsh-harness-dev-context（实现 checkout 说明，order 10000）' },
+  { match: (name) => name === 'app:web-surface', owner: '@deepseek-ai/dsh-harness-dev-context（Web 表面说明，order 10100）' },
+  { match: (name) => name === 'deployment:persona-prefix', owner: 'dsh-system-prompt 配置 config.personaPrefix（order 0）；可按 agent 由 dsh-subagent 覆盖' },
+  { match: (name) => name === 'deployment:persona-suffix', owner: 'dsh-system-prompt 配置 config.personaSuffix（order 10200）' },
   { match: (name) => name.startsWith('plan:'), owner: '@deepseek-ai/dsh-plan-mode（计划模式策略段）' },
   { match: (name) => name.startsWith('tool:'), owner: '工具插件（@deepseek-ai/dsh-tool-*，经 dsh-tools 注册）' },
   { match: (name) => name.startsWith('tools:') || name.startsWith('code-'), owner: '@deepseek-ai/dsh-tools（工具/代码模式引导）' },
@@ -83,8 +91,12 @@ function resolveOwner(name) {
 
 /** Known numeric orders for well-known sections (registry drops order from assembled sections). */
 const ORDER_HINTS = new Map([
-  ['harness:identity', -100],
-  ['deployment:persona', 0]
+  ['harness:identity', -1000],
+  ['deployment:persona-prefix', 0],
+  ['plan:policy', 500],
+  ['harness:source', 10000],
+  ['app:web-surface', 10100],
+  ['deployment:persona-suffix', 10200]
 ])
 
 /** Order hint for the pipeline view: known numeric order, else relative position. */
@@ -147,7 +159,7 @@ function normalizePreset(raw, name) {
  *   result is re-sorted by stable ascending order: sections with an explicit
  *   order jump to that numeric position, all other sections keep their current
  *   array index as the sort key (preserving the registry's base order and the
- *   anchor-based placement of non-ordered inserts). An `order` below -100 puts
+ *   anchor-based placement of non-ordered inserts). An `order` below -1000 puts
  *   the section ahead of harness:identity (压倒一切); `top: true` uses TOP_ORDER.
  * @param sections - assembled sections (never mutated).
  * @param overrides - normalized preset rules.
@@ -570,13 +582,16 @@ class PromptManager extends Service {
     let apiKey = null
     if (credentials !== undefined) {
       try {
+        // resolve() already layers the managed store, process env, and .env fallbacks.
         const resolved = await credentials.resolve('DEEPSEEK_API_KEY')
-        apiKey = typeof resolved === 'string' && resolved !== '' ? resolved : null
+        apiKey = typeof resolved?.value === 'string' && resolved.value !== '' ? resolved.value : null
       } catch { /* 凭证解析失败 */ }
     }
     if (apiKey === null) throw new Error('translate: DEEPSEEK_API_KEY credential not available (请通过设置-模型页配置 DeepSeek API Key)')
     const model = String(payload?.model ?? 'deepseek-chat')
     const baseUrl = String(payload?.baseURL ?? 'https://api.deepseek.com')
+    const targetLabel = target === 'zh' ? 'Simplified Chinese (zh-CN)' : target
+    const prompt = `Translate the following text into ${targetLabel}. Preserve Markdown structure, code blocks, identifiers, inline code, and {{variable}} placeholders exactly. Return only the translation without commentary.\n\n${text}`
     const res = await fetch(`${baseUrl}/chat/completions`, {
       method: 'POST',
       headers: {
@@ -774,7 +789,7 @@ function foldError(error) {
   return { ok: false, error: { code: 'internal', message: String(error?.message ?? error), details: {} } }
 }
 
-/** Dispatcher for `prompt-manager/<method>` endpoints. */
+/** Dispatcher for the `<RPC_CHANNEL>/<method>` endpoints. */
 async function handleRpc(manager, method, payload) {
   switch (method) {
     case 'getCatalog': return manager.getCatalog()
@@ -795,9 +810,94 @@ async function handleRpc(manager, method, payload) {
   }
 }
 
+/** Read a buffered JSON body, rejecting bodies above the channel cap. */
+async function readRequestBody(req) {
+  const chunks = []
+  let received = 0
+  for await (const chunk of req) {
+    received += chunk.byteLength
+    if (received > MAX_RPC_BODY_BYTES) {
+      const error = new Error('rpc body too large')
+      error.code = 'RPC_BODY_TOO_LARGE'
+      throw error
+    }
+    chunks.push(chunk)
+  }
+  return Buffer.concat(chunks).toString('utf8')
+}
+
+/**
+ * Build the prefix route serving the client-request/server-response envelope.
+ * Connection's auth hook applies the same Host/Origin fence and browser-session
+ * check as `/api`; only the envelope handling lives here.
+ */
+function createRpcRoute(manager, connection) {
+  return {
+    kind: 'prefix',
+    path: RPC_CHANNEL,
+    handler: async (req, res) => {
+      const admission = connection.admit(req)
+      if ('rejection' in admission) {
+        res.writeHead(admission.rejection)
+        res.end(admission.rejection === 401 ? 'unauthorized' : 'forbidden')
+        return
+      }
+      if (admission.peer.principal.kind !== 'owner') {
+        res.writeHead(403)
+        res.end('forbidden')
+        return
+      }
+      const pathname = new URL(req.url ?? '/', 'http://dsh.internal').pathname
+      const endpoint = pathname.startsWith(`${RPC_CHANNEL}/`) ? pathname.slice(RPC_CHANNEL.length + 1) : ''
+      if (req.method !== 'POST' || !RPC_ENDPOINT_RE.test(endpoint)) {
+        res.writeHead(404)
+        res.end('not found')
+        return
+      }
+      if ((req.headers['content-type'] ?? '').split(';', 1)[0].trim().toLowerCase() !== 'application/json') {
+        res.writeHead(415)
+        res.end('content type must be application/json')
+        return
+      }
+      let body
+      try {
+        body = JSON.parse(await readRequestBody(req))
+      } catch (error) {
+        if (error?.code === 'RPC_BODY_TOO_LARGE') {
+          res.writeHead(413, { connection: 'close' })
+          res.end()
+          req.destroy()
+          return
+        }
+        res.writeHead(400)
+        res.end('body is not JSON')
+        return
+      }
+      const rpcId = typeof body?.rpcId === 'string' ? body.rpcId : 'invalid-request'
+      const respond = (result) => {
+        res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store' })
+        res.end(JSON.stringify({ type: 'server-response', rpcId, result }))
+      }
+      if (body?.type !== 'client-request' || typeof body?.rpcId !== 'string' || typeof body?.method !== 'string') {
+        respond({ ok: false, error: { code: 'gateway/bad-request', message: 'invalid client-request message', details: {} } })
+        return
+      }
+      if (body.method !== endpoint) {
+        respond({ ok: false, error: { code: 'gateway/bad-request', message: `method ${JSON.stringify(body.method)} does not match endpoint ${JSON.stringify(endpoint)}`, details: {} } })
+        return
+      }
+      try {
+        respond({ ok: true, value: await handleRpc(manager, endpoint, body.payload) })
+      } catch (error) {
+        respond(foldError(error))
+      }
+    }
+  }
+}
+
 /**
  * Cordis plugin body: mount the service, the assembly waterfall hook, the
- * agent tools, and the loopback /api RPC surface.
+ * agent tools, and the dedicated Connection RPC channel.
  * @param ctx - the host context.
  * @param config - the prompt-manager row config.
  */
@@ -812,7 +912,7 @@ export function apply(ctx, config) {
     manager.lastPristine = { ...assembly, sections: [...assembly.sections], contexts: [...assembly.contexts] }
     // Catalog refresh marks its own call so its pristine lands in a dedicated
     // slot (agent-scoped assembles overwrite `lastPristine` concurrently).
-    if (context !== null && context !== undefined && context.__catalogRefresh === true) {
+    if (context?.__catalogRefresh === true) {
       manager.lastCatalogPristine = [...assembly.sections]
     }
     const result = await next()
@@ -821,7 +921,7 @@ export function apply(ctx, config) {
       ? result
       : { ...result, sections: applyPreset(result.sections, rules) }
     manager.lastApplied = applied
-    if (context.agent !== undefined) {
+    if (context?.agent !== undefined) {
       const session = context.agent.session
       const sessionId = session?.id ?? 'unknown'
       const cwd = session?.header?.cwd ?? ''
@@ -920,30 +1020,41 @@ export function apply(ctx, config) {
         manager.lastSkillsCatalog = skillsCatalog
         if (manager.lastReal !== null) manager.lastReal.skillsCatalog = skillsCatalog
       }
-      // 技能目录（权威）：用 agent scope 枚举 ctx.skills（与 tool-skill 同款 snapshot 路径）
-      try {
-        const agent = payload?.agent
-        const skillsSvc = ctx.get('skills')
-        if (agent !== undefined && skillsSvc !== undefined) {
-          const snap = await skillsSvc.snapshot({
-            scope: agent,
-            cwd: agent.session?.header?.cwd
-          })
-          if (snap.complete) {
-            const lines = []
-            for (const skill of snap.skills) {
-              if (!isModelInvocable(skill)) continue
-              let line = `- \`${skill.name}\`: ${skill.description ?? ''}`
-              if (skill.whenToUse) line += ` ${skill.whenToUse}`
-              lines.push(line)
+      // 技能目录兜底：本轮没有捕获到 tool-skill 注入的目录消息时，才用 agent
+      // scope 枚举 ctx.skills 重建（有捕获时以消息原文为准——0.2 会按 digest
+      // 复用目录或发“替换目录”消息，重渲染可能与之不一致）。
+      if (skillsCatalog === null) {
+        try {
+          const agent = payload?.agent
+          const skillsSvc = ctx.get('skills')
+          if (agent !== undefined && skillsSvc !== undefined) {
+            const snap = await skillsSvc.snapshot({
+              scope: agent,
+              cwd: agent.session?.header?.cwd
+            })
+            if (snap.complete) {
+              const lines = []
+              for (const skill of snap.skills) {
+                if (!isModelInvocable(skill)) continue
+                lines.push(`- \`${skill.name}\`: ${skill.description ?? ''}`)
+              }
+              const text = [
+                '<system-reminder>',
+                'A skill is a reusable set of task-specific instructions. The following skills are available in this session:',
+                '',
+                '<available_skills>',
+                ...lines,
+                '</available_skills>',
+                '',
+                "If the user names a skill, or the task clearly matches a skill's description, call the `skill` tool with the exact skill name before taking task actions. Load all applicable skills, then follow their full instructions. This catalog contains summaries only; do not infer or follow a skill's instructions until it has been loaded.",
+                '</system-reminder>'
+              ].join('\n')
+              manager.lastSkillsCatalog = text
+              if (manager.lastReal !== null) manager.lastReal.skillsCatalog = text
             }
-            const text = '<system-reminder>\nA skill is a reusable set of task-specific instructions. The following skills are available in this session:\n\n<available_skills>\n' +
-              lines.join('\n') + '\n</available_skills>\n\nIf the user names a skill, or the task clearly matches its description, call the `skill` tool with the exact name before acting.\n</system-reminder>'
-            manager.lastSkillsCatalog = text
-            if (manager.lastReal !== null) manager.lastReal.skillsCatalog = text
           }
-        }
-      } catch { /* 技能枚举失败时保留消息路径捕获 */ }
+        } catch { /* 技能枚举失败时保留消息路径捕获 */ }
+      }
     } catch { /* 消息结构变化时忽略 */ }
     return result
   })
@@ -1049,7 +1160,7 @@ export function apply(ctx, config) {
 
   ctx.tools.register(defineTool({
     name: 'get_prompt',
-    description: 'Read the current text of one system-prompt section by name (e.g. deployment:persona, harness:identity, plan-mode sections). Returns null when the section is not present in the global catalog.',
+    description: 'Read the current text of one system-prompt section by name (e.g. deployment:persona-prefix, harness:identity, plan:policy). Returns null when the section is not present in the global catalog.',
     parameters: {
       section: { type: 'string', required: true, description: 'Section name to read.' }
     },
@@ -1103,21 +1214,23 @@ export function apply(ctx, config) {
     }
   }))
 
-  // Loopback /api RPC surface for the web client half.
-  ctx.inject(['connection'], (connectionCtx) => {
-    connectionCtx.connection.rpc.intercept('/api', (endpoint) => endpoint.startsWith('prompt-manager/'), async (endpoint, payload) => {
-      try {
-        return { ok: true, value: await handleRpc(manager, endpoint.slice('prompt-manager/'.length), payload) }
-      } catch (error) {
-        return foldError(error)
-      }
-    }, { authority: 'loopback' })
+  // Dedicated RPC channel for the web client half and the pipeline page.
+  // `/api` is owned by the dsh API gateway in 0.2, so the plugin mounts its own
+  // prefix route and asks Connection to apply the same Host/Origin + browser
+  // authentication fence. (`connection.rpc.handle` currently resolves the
+  // channel owner against the provider fiber, which cannot see the consumer's
+  // `webServer`; the Fetch route below uses the documented auth hook instead.)
+  ctx.inject(['connection', 'webServer'], (connectionCtx) => {
+    connectionCtx.effect(
+      () => connectionCtx.webServer.register(createRpcRoute(manager, connectionCtx.connection)),
+      'prompt-manager: rpc channel'
+    )
   })
 
   // Standalone full-screen pipeline page (幕布): /prompt-manager/pipeline.
   // Served by the host web server so the pipeline page gets the whole window
   // instead of the settings panel; the page fetches getPipeline over the
-  // loopback /api RPC. 页面每次请求实时读文件（不缓存），开发期改
+  // dedicated RPC channel. 页面每次请求实时读文件（不缓存），开发期改
   // pipeline.html 无需重启 dsh web。路由名取数据语义（pipeline/幕布），
   // 不取渲染形态（canvas）——形态可变、语义稳定，见 docs/DESIGN.md §15.5e。
   ctx.inject(['webServer'], (webCtx) => {

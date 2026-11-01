@@ -262,10 +262,11 @@ function truncate(text, max) {
 	return text.length > max ? text.slice(0, max) + "…" : text;
 }
 
-// ── RPC：直连 host（同源 loopback） ──────────────────────────────────────
+// ── RPC：直连 host 的专用 Connection 通道（同源、浏览器会话鉴权） ────────
+const RPC_CHANNEL = "/prompt-manager-rpc";
 async function callRpc(endpoint, payload) {
 	const body = { type: "client-request", rpcId: crypto.randomUUID(), method: endpoint, payload: payload ?? {} };
-	const res = await fetch("/api/" + endpoint, {
+	const res = await fetch(RPC_CHANNEL + "/" + endpoint, {
 		method: "POST",
 		headers: { "Content-Type": "application/json" },
 		body: JSON.stringify(body)
@@ -292,10 +293,11 @@ const TAG_LABELS = {
 
 // ── hover 实体解释表（hash）：能解释的节点尽量解释，未收录的不显示 ──────
 const ENTITY_EXPLANATIONS = {
-	"src:harness:identity": "身份段（order -100）：声明 agent 由 DeepSeek Harness 驱动，位于系统提示词最前（dsh-system-prompt 内置）。",
+	"src:harness:identity": "身份段（order -1000）：声明 agent 由 DeepSeek Harness 驱动，位于系统提示词最前（dsh-system-prompt 内置）。",
 	"src:harness:source": "实现来源说明段：提示 agent 当前运行的 DSH 实现 checkout 位置与工作目录（启动注入）。",
 	"src:app:web-surface": "Web 表面说明段：描述当前交互界面（Web GUI）与 checkout 的关系（dsh-web-app 注册）。",
-	"src:deployment:persona": "persona 段（order 0）：部署定义的 agent 人格与职责；可被 dsh-persona 按 agent 覆盖。",
+	"src:deployment:persona-prefix": "persona 前缀段（order 0）：部署定义的 agent 人格与职责；可被 dsh-subagent 按 agent 覆盖。",
+	"src:deployment:persona-suffix": "persona 后缀段（order 10200）：部署定义的人格补充说明，渲染在提示词末尾。",
 	"src:plan:": "计划模式策略段（dsh-plan-mode 注册）：plan-mode 下约束 agent 只规划、不执行。",
 	"src:tool:": "工具说明段（tool:*）：每个工具的提示词说明，教模型如何调用该工具（工具插件经 dsh-tools 注册）。",
 	"src:ui:": "前端插件提示词段（dsh-client-ui-* 注册）。",
@@ -334,7 +336,7 @@ function computeLayout(pipeline, expandedGroups) {
 	const singles = [];
 	const coveredSet = new Set(pipeline.stages.override.map((o) => o.section));
 	const hasVarsRef = (text) => /\{\{[a-z][a-z0-9_]*\}\}/.test(text);
-	// order 徽章：真实 order（已知段，如 -100/0）显示 "order -100"；未知段的相对顺序占位显示 "#5"
+	// order 徽章：真实 order（已知段，如 -1000/0）显示 "order -1000"；未知段的相对顺序占位显示 "#5"
 	const orderBadge = (hint) => (hint <= 0 ? "order " + hint : "#" + hint);
 	// 来源段生效状态徽章：host 已算好 status（active/empty/overridden/removed）
 	const statusBadge = (s) => {
@@ -732,7 +734,7 @@ async function load(sel) {
 		roundIndex = Number.isFinite(sel.index) ? sel.index : 0;
 	}
 	try {
-		pipeline = await callRpc("prompt-manager/getPipeline", sel);
+		pipeline = await callRpc("getPipeline", sel);
 		expandedGroups = new Set(); // 切换轮次/加载时重置展开状态
 		layout = computeLayout(pipeline, expandedGroups);
 		renderNodes();
@@ -806,7 +808,7 @@ function updateRoundLabel() {
 /** 拉取并渲染对话历史（按 session 分类）。 */
 async function refreshHistory() {
 	try {
-		const data = await callRpc("prompt-manager/getHistory", {});
+		const data = await callRpc("getHistory", {});
 		historySessions = data.sessions || [];
 		renderHistoryPanel();
 		// 跟随模式：当前选中的 session 有新轮次且在看最新轮 → 自动切到最新
@@ -1019,7 +1021,7 @@ async function loadPresets() {
 	presetsBusy = true;
 	presetsBody.innerHTML = '<div class="pempty">加载中…</div>';
 	try {
-		presetsData = await callRpc("prompt-manager/listPresets", {});
+		presetsData = await callRpc("listPresets", {});
 		renderPresetPanel();
 	} catch (e) {
 		presetsBody.innerHTML = '<div class="pempty">加载失败：' + escapeHtml((e && e.message) ? e.message : e) + "</div>";
@@ -1089,7 +1091,7 @@ function renderPresetPanel() {
 
 async function togglePreset(name, active) {
 	try {
-		await callRpc("prompt-manager/setActive", { name: active ? "" : name });
+		await callRpc("setActive", { name: active ? "" : name });
 		await loadPresets();
 		await load(); // 重载当前轮次：主图覆盖列/来源段状态标记随激活变化
 	} catch (e) {
@@ -1142,7 +1144,7 @@ const draftPanel = document.getElementById("draft-panel");
 const draftBody = document.getElementById("draft-body");
 const draftParam = new URLSearchParams(location.search).get("draft");
 const draftPresetParam = new URLSearchParams(location.search).get("preset"); // 来自编辑器的预设名（可选）
-const DRAFT_TOP_ORDER = -1000; // 与 host normalizePreset 的置顶哨兵一致
+const DRAFT_TOP_ORDER = -2000; // 与 host normalizePreset 的置顶哨兵一致
 let draftOverrides = null;     // 当前草稿规则（可变，拖拽/保存都改它）
 let draftPreviewData = null;   // 最近一次预览响应（含每段精确排序 key）
 
@@ -1161,7 +1163,7 @@ async function loadDraftPreview() {
 async function refreshDraftPreview() {
 	draftBody.innerHTML = '<div class="empty">计算草稿落位中…</div>';
 	try {
-		const data = await callRpc("prompt-manager/previewPreset", { overrides: draftOverrides });
+		const data = await callRpc("previewPreset", { overrides: draftOverrides });
 		draftPreviewData = data;
 		renderDraftPreview(data);
 	} catch (e) {
@@ -1261,8 +1263,8 @@ document.getElementById("btn-draft-save").addEventListener("click", async () => 
 	statusEl.textContent = "保存中…";
 	statusEl.className = "dstatus";
 	try {
-		if (exists) await callRpc("prompt-manager/updatePreset", { name, overrides: draftOverrides });
-		else await callRpc("prompt-manager/createPreset", { name, overrides: draftOverrides });
+		if (exists) await callRpc("updatePreset", { name, overrides: draftOverrides });
+		else await callRpc("createPreset", { name, overrides: draftOverrides });
 		statusEl.textContent = "已保存 ✓（下一次模型步骤生效）";
 		statusEl.className = "dstatus ok";
 		void loadPresets();
@@ -1277,7 +1279,7 @@ document.getElementById("btn-draft-save").addEventListener("click", async () => 
 	void loadPresets(); // 左侧预设面板与主图并行加载
 	void loadDraftPreview(); // 草稿预览浮层（无 ?draft= 时为空操作）
 	try {
-		const data = await callRpc("prompt-manager/getHistory", {});
+		const data = await callRpc("getHistory", {});
 		historySessions = data.sessions || [];
 	} catch (e) { historySessions = []; }
 	if (historySessions.length > 0) {
